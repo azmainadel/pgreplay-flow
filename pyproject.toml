@@ -9,6 +9,9 @@ dependencies = [
     "psycopg-pool==3.3.3",
 ]
 
+[project.scripts]
+pgreplay-flow = "pgreplay_flow.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest==9.1.1",
