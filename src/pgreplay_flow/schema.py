@@ -92,6 +92,11 @@ ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS attached   boolean NOT NULL DEFAUL
 CREATE INDEX IF NOT EXISTS runs_parent_idx
     ON {s}.runs (parent_id) WHERE parent_id IS NOT NULL;
 
+-- v2: deleting a run cascades to its signals by run_id. The partial index
+-- above only covers unconsumed signals, so without this every cascade is a
+-- full scan of signals.
+CREATE INDEX IF NOT EXISTS signals_run_idx ON {s}.signals (run_id);
+
 -- v2: retention cleanup scans terminal runs by age.
 CREATE INDEX IF NOT EXISTS runs_finished_idx
     ON {s}.runs (finished_at)

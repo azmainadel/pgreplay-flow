@@ -392,3 +392,18 @@ async def test_parent_recovering_after_crash_reuses_child(flow, start_worker, mo
     assert crashed == [child["id"]]
     assert (await flow.get_run(run_id))["recoveries"] == 1
     assert kid_runs == [1]
+
+
+async def test_signal_cascade_on_purge_uses_an_index(flow, schema):
+    """Regression: purging a run cascades to signals by run_id, which was a
+    sequential scan because only unconsumed signals were indexed."""
+    async with flow.pool.connection() as conn, conn.transaction():
+        await conn.execute("SET LOCAL enable_seqscan = off")
+        cur = await conn.execute(
+            sql.SQL("EXPLAIN DELETE FROM {}.signals WHERE run_id = %s").format(
+                sql.Identifier(schema)
+            ),
+            (uuid.uuid4(),),
+        )
+        plan = " ".join(r[0] for r in await cur.fetchall())
+    assert "signals_run_idx" in plan, plan
