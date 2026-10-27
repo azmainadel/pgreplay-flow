@@ -16,11 +16,14 @@ on replay.
 
 Suspension
 ----------
-A wait that cannot finish inline (long sleep, retry backoff, signal) *parks*:
-it records its deadline and blocks. When every allocated op has either
-finished or parked, the run is quiescent: the worker cancels the coroutine
-and suspends the run until the earliest parked deadline. This lets
-`gather(sleep(10), sleep(5))` wake at 5, not 10.
+A wait that cannot finish inline (long sleep, retry backoff, signal, child)
+*parks*: it records its deadline and blocks. The run is quiescent when no ctx
+op is in flight, something is parked, and every live workflow task is idle:
+parked itself, or blocked only on other workflow tasks (gather, TaskGroup).
+A task in any other await (asyncio.sleep, a socket, a thread) is busy and
+keeps the run alive. On quiescence the worker cancels the coroutine and
+suspends the run until the earliest parked deadline, so
+`gather(sleep(10), sleep(5))` wakes at 5, not 10.
 """
 
 from __future__ import annotations
@@ -141,10 +144,11 @@ async def _invoke(fn: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
 
 
 class _Scope:
-    __slots__ = ("children", "counter", "path")
+    __slots__ = ("children", "counter", "owner", "path")
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, owner: WorkflowContext):
         self.path = path
+        self.owner = owner
         self.counter = 0
         self.children = 0
 
@@ -161,15 +165,19 @@ def install_task_factory(loop: asyncio.AbstractEventLoop | None = None) -> None:
         return
 
     def factory(loop: asyncio.AbstractEventLoop, coro: Any, **kw: Any) -> asyncio.Future:
-        parent = _SCOPE.get()
+        # Use the scope of the context the task will run in: create_task(...,
+        # context=contextvars.Context()) opts an internal task out of the workflow.
+        given = kw.get("context")
+        parent = given.get(_SCOPE) if given is not None else _SCOPE.get()
         if parent is not None:
-            ctx = kw.get("context") or contextvars.copy_context()
+            ctx = given if given is not None else contextvars.copy_context()
             parent.children += 1
-            ctx.run(_SCOPE.set, _Scope(f"{parent.path}t{parent.children}/"))
+            ctx.run(_SCOPE.set, _Scope(f"{parent.path}t{parent.children}/", parent.owner))
             kw["context"] = ctx
-        if prev is not None:
-            return prev(loop, coro, **kw)
-        return asyncio.Task(coro, loop=loop, **kw)
+        task = prev(loop, coro, **kw) if prev is not None else asyncio.Task(coro, loop=loop, **kw)
+        if parent is not None and isinstance(task, asyncio.Task):
+            parent.owner._register_task(task, asyncio.current_task(loop))
+        return task
 
     factory.__pgreplay_flow__ = True  # type: ignore[attr-defined]
     loop.set_task_factory(factory)
@@ -203,6 +211,9 @@ class WorkflowContext:
         # Quiescence tracking (live mode only).
         self._pending = 0
         self._parked: dict[str, tuple[str, float | None]] = {}
+        self._park_futures: set[asyncio.Future] = set()
+        # Live workflow tasks -> the task that created them.
+        self._tasks: dict[asyncio.Task, asyncio.Task | None] = {}
         self._confirm_task: asyncio.Task | None = None
         self._closed = False
         self.quiescent = asyncio.Event()
@@ -211,9 +222,16 @@ class WorkflowContext:
 
     async def _main(self, fn: Callable[..., Awaitable[Any]], args: list, kwargs: dict) -> Any:
         install_task_factory()
-        self._root = _Scope("")
+        self._root = _Scope("", self)
         _SCOPE.set(self._root)
+        root = asyncio.current_task()
+        if root is not None:
+            self._register_task(root, None)
         return await fn(self, *args, **kwargs)
+
+    def _register_task(self, task: asyncio.Task, parent: asyncio.Task | None) -> None:
+        self._tasks[task] = parent
+        task.add_done_callback(self._tasks.pop)  # type: ignore[arg-type]
 
     def close(self) -> None:
         """Called before the workflow coroutine is cancelled for suspension: any
@@ -279,19 +297,48 @@ class WorkflowContext:
             )
 
     async def _confirm(self) -> None:
-        # Let freshly scheduled tasks (e.g. gather children) start and allocate.
+        # Let freshly scheduled tasks (e.g. gather children) start and allocate,
+        # then keep re-checking while a branch is busy outside ctx: a busy task
+        # may later become idle without issuing an op (e.g. it starts awaiting
+        # siblings that are already parked), so polling is the only trigger.
         try:
             for _ in range(3):
                 await asyncio.sleep(0)
-            if self._pending == 0 and self._parked:
-                self.quiescent.set()
+            while self._pending == 0 and self._parked and not self._closed:
+                if self._all_tasks_idle():
+                    self.quiescent.set()
+                    return
+                await asyncio.sleep(0.05)
         finally:
             self._confirm_task = None
 
+    def _all_tasks_idle(self) -> bool:
+        return all(self._task_idle(t) for t in list(self._tasks) if not t.done())
+
+    def _task_idle(self, task: asyncio.Task) -> bool:
+        """Is this workflow task blocked only on ctx waits or on other workflow
+        tasks? `_fut_waiter` is a CPython implementation detail (present in
+        3.11-3.14); without it we fall back to counting ctx ops only."""
+        if not hasattr(task, "_fut_waiter"):
+            return True
+        waiter = task._fut_waiter  # type: ignore[attr-defined]
+        if waiter is None:
+            return False  # runnable
+        if waiter in self._park_futures or waiter in self._tasks:
+            return True
+        children = getattr(waiter, "_children", None)  # asyncio.gather()
+        if children is not None:
+            return all(c.done() or c in self._tasks for c in children)
+        # A plain future. TaskGroup.__aexit__ waits on one of these until its
+        # children finish: idle iff the task has live workflow children.
+        return any(p is task and not c.done() for c, p in self._tasks.items())
+
     async def _park(self, key: str, kind: str, until: float | None) -> Any:
         self._parked[key] = (kind, until)
+        fut = asyncio.get_running_loop().create_future()
+        self._park_futures.add(fut)
         self._op_done()
-        await asyncio.get_running_loop().create_future()  # resolved only by cancellation
+        await fut  # resolved only by cancellation
 
     def _entry(self, key: str, kind: str, name: str) -> dict[str, Any] | None:
         entry = self._journal.get(key)

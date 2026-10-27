@@ -418,3 +418,52 @@ async def test_non_retryable_error_fails_immediately(flow, start_worker):
         await flow.run(wf, timeout=10)
     assert len(calls) == 1
 
+
+async def test_busy_branch_is_not_suspended_while_sibling_sleeps(flow, start_worker):
+    """Regression: a gather() branch doing a plain await (not a ctx op) must keep
+    the run alive; previously the run suspended and cancelled the branch."""
+    t0 = time.time()
+
+    async def stamp():
+        return time.time()
+
+    @flow.workflow(name="mixed_branches")
+    async def wf(ctx):
+        async def long_branch():
+            await ctx.sleep(3)
+
+        async def busy_branch():
+            await asyncio.sleep(0.3)  # not a ctx op
+            return await ctx.step(stamp)
+
+        _, stamped = await asyncio.gather(long_branch(), busy_branch())
+        return stamped
+
+    start_worker(inline_wait_max=0.05)
+    stamped = await flow.run(wf, timeout=15)
+    assert stamped - t0 < 2.0  # ran right away, not after the 3s sleep
+
+
+async def test_busy_branch_can_signal_its_waiting_sibling(flow, start_worker):
+    """Regression: with a signal wait (no wake-up time), premature suspension
+    stranded the run forever."""
+    holder = {}
+
+    async def send():
+        await flow.send_signal(holder["id"], "go", "hello")
+
+    @flow.workflow(name="self_signal")
+    async def wf(ctx):
+        async def waiter():
+            return await ctx.wait_for_signal("go")
+
+        async def sender():
+            await asyncio.sleep(0.3)
+            await ctx.step(send)
+
+        got, _ = await asyncio.gather(waiter(), sender())
+        return got
+
+    start_worker(inline_wait_max=0.05)
+    holder["id"] = await flow.start(wf)
+    assert await flow.result(holder["id"], timeout=10) == "hello"
