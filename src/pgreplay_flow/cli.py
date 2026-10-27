@@ -22,8 +22,9 @@ from datetime import datetime
 from typing import Any
 
 from .errors import FlowError, RunNotFound, WorkflowCancelled, WorkflowFailed
-from .flow import Flow, Worker
+from .flow import Flow
 from .metrics import render_stats, serve_metrics
+from .worker import Worker
 
 DEFAULT_SCHEMA = "pgreplay_flow"
 

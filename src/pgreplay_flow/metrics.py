@@ -15,7 +15,8 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .flow import Flow, Worker
+    from .flow import Flow
+    from .worker import Worker
 
 log = logging.getLogger("pgreplay_flow")
 
