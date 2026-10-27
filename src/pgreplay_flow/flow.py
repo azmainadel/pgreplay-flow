@@ -450,6 +450,49 @@ class Flow:
 
     # -- retention ----------------------------------------------------------------
 
+    # Which runs retention may delete. Shared by purge() and count_purgeable()
+    # so a dry run always agrees with the real thing. {0} = schema, r = the run.
+    _PURGEABLE = """
+        r.status = ANY(%s)
+        AND r.finished_at < now() - make_interval(secs => %s)
+        AND (%s::text IS NULL OR r.workflow = %s)
+        -- an attached child is kept until its parent has copied its result
+        AND NOT (r.attached AND EXISTS (
+              SELECT 1 FROM {0}.runs p
+              WHERE p.id = r.parent_id
+                AND p.status NOT IN ('completed','failed','cancelled')))
+    """
+
+    @staticmethod
+    def _purge_params(
+        older_than: float, workflow: str | None, statuses: tuple[str, ...]
+    ) -> tuple[list[str], float, str | None, str | None]:
+        bad = set(statuses) - set(TERMINAL)
+        if bad:
+            raise ValueError(f"can only purge terminal statuses, not {sorted(bad)}")
+        if older_than < 0:
+            raise ValueError("older_than must be >= 0")
+        return list(statuses), older_than, workflow, workflow
+
+    async def count_purgeable(
+        self,
+        older_than: float,
+        *,
+        workflow: str | None = None,
+        statuses: tuple[str, ...] = TERMINAL,
+    ) -> int:
+        """How many runs purge() with the same arguments would delete right now."""
+        params = self._purge_params(older_than, workflow, statuses)
+        async with self.pool.connection() as conn:
+            cur = await conn.execute(
+                sql.SQL("SELECT count(*) FROM {0}.runs r WHERE " + self._PURGEABLE).format(
+                    sql.Identifier(self.schema)
+                ),
+                params,
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
     async def purge(
         self,
         older_than: float,
@@ -465,31 +508,16 @@ class Flow:
         workers at once. An attached child is kept while its parent is still
         running, because the parent has not copied its result yet.
         """
-        bad = set(statuses) - set(TERMINAL)
-        if bad:
-            raise ValueError(f"can only purge terminal statuses, not {sorted(bad)}")
-        if older_than < 0:
-            raise ValueError("older_than must be >= 0")
+        params = self._purge_params(older_than, workflow, statuses)
+        stmt = sql.SQL(
+            "DELETE FROM {0}.runs WHERE id IN ("
+            " SELECT r.id FROM {0}.runs r WHERE " + self._PURGEABLE +
+            " ORDER BY r.finished_at LIMIT %s FOR UPDATE SKIP LOCKED)"
+        ).format(sql.Identifier(self.schema))
         total = 0
         while True:
             async with self.pool.connection() as conn, conn.transaction():
-                cur = await conn.execute(
-                    sql.SQL("""
-                    DELETE FROM {0}.runs WHERE id IN (
-                        SELECT r.id FROM {0}.runs r
-                        WHERE r.status = ANY(%s)
-                          AND r.finished_at < now() - make_interval(secs => %s)
-                          AND (%s::text IS NULL OR r.workflow = %s)
-                          AND NOT (r.attached AND EXISTS (
-                                SELECT 1 FROM {0}.runs p
-                                WHERE p.id = r.parent_id
-                                  AND p.status NOT IN ('completed','failed','cancelled')))
-                        ORDER BY r.finished_at
-                        LIMIT %s
-                        FOR UPDATE SKIP LOCKED)
-                    """).format(sql.Identifier(self.schema)),
-                    (list(statuses), older_than, workflow, workflow, batch_size),
-                )
+                cur = await conn.execute(stmt, (*params, batch_size))
                 n = cur.rowcount
             total += n
             if n < batch_size:

@@ -104,7 +104,7 @@ async def test_end_to_end_commands(flow, start_worker, app_module, capsys):
     assert json.loads(out) == 42
 
     code, out, _ = await cli(capsys, "purge", "--older-than", "1d", "--dry-run")
-    assert code == 0 and "would delete about 0" in out
+    assert code == 0 and "would delete 0 run(s)" in out
     code, out, _ = await cli(capsys, "purge", "--older-than", "0s")
     assert code == 0 and "deleted 3 run(s)" in out
 

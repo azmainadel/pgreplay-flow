@@ -269,11 +269,8 @@ async def cmd_fork(flow: Flow, args: argparse.Namespace) -> int:
 async def cmd_purge(flow: Flow, args: argparse.Namespace) -> int:
     statuses = tuple(args.status) if args.status else ("completed", "failed", "cancelled")
     if args.dry_run:
-        runs = [r for st in statuses
-                for r in await flow.list_runs(status=st, workflow=args.workflow, limit=100_000)]
-        cutoff = datetime.now().astimezone().timestamp() - args.older_than
-        n = sum(1 for r in runs if r["finished_at"] and r["finished_at"].timestamp() < cutoff)
-        print(f"would delete about {n} run(s)")
+        n = await flow.count_purgeable(args.older_than, workflow=args.workflow, statuses=statuses)
+        print(f"would delete {n} run(s)")
         return 0
     n = await flow.purge(args.older_than, workflow=args.workflow, statuses=statuses)
     print(f"deleted {n} run(s)")

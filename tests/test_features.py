@@ -221,7 +221,9 @@ async def test_purge_deletes_only_old_terminal_runs(flow, start_worker, schema):
     fresh = await flow.start(quick, 99)
     await flow.result(fresh, timeout=10)
 
+    assert await flow.count_purgeable(3600) == 5
     assert await flow.purge(3600, batch_size=2) == 5  # several batches
+    assert await flow.count_purgeable(3600) == 0
     remaining = {r["id"] for r in await flow.list_runs(limit=100)}
     assert remaining == {waiting, fresh}
     async with flow.pool.connection() as conn:
@@ -254,6 +256,8 @@ async def test_purge_keeps_child_of_unfinished_parent(flow, start_worker, schema
             break
         await asyncio.sleep(0.05)
     await _age_runs(flow, schema, 7200)
+    # Regression: the dry-run count must apply the same rule as purge().
+    assert await flow.count_purgeable(60) == 0
     assert await flow.purge(60) == 0
     with pytest.raises(ValueError):
         await flow.purge(60, statuses=("running",))
