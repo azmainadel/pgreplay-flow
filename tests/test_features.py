@@ -1,6 +1,7 @@
-"""Child workflows and retention purge."""
+"""Child workflows, retention purge and metrics."""
 
 import asyncio
+import contextlib
 import uuid
 
 import pytest
@@ -13,6 +14,7 @@ from pgreplay_flow import (
     WorkflowCancelled,
     WorkflowFailed,
 )
+from pgreplay_flow.metrics import collect, serve_metrics
 
 # -- child workflows -------------------------------------------------------------
 
@@ -266,12 +268,85 @@ async def test_worker_background_purge(flow, start_worker, schema):
     run_id = await flow.start(old)
     await flow.result(run_id, timeout=10)
     await _age_runs(flow, schema, 100)
-    start_worker(purge_after=50, purge_interval=0.2)
+    w = start_worker(purge_after=50, purge_interval=0.2)
     for _ in range(50):
         if not await flow.list_runs():
             break
         await asyncio.sleep(0.1)
     assert await flow.list_runs() == []
+    assert w.metrics.get("runs_purged_total") == 1
+
+
+# -- metrics -------------------------------------------------------------------------
+
+
+async def test_worker_metrics_and_stats(flow, start_worker):
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("once")
+        return "ok"
+
+    @flow.workflow(name="metered")
+    async def metered(ctx):
+        await ctx.sleep(0.3)
+        return await ctx.step(flaky)
+
+    w = start_worker(inline_wait_max=0.05)
+    from pgreplay_flow import RetryPolicy
+
+    flow.workflows["metered"] = flow.workflows["metered"].__class__(
+        "metered", metered, "default", RetryPolicy(max_attempts=3, initial_delay=0.01)
+    )
+    run_id = await flow.start(metered)
+    assert await flow.result(run_id, timeout=10) == "ok"
+
+    m = w.metrics
+    assert m.get("runs_finished_total", workflow="metered", status="completed") == 1
+    assert m.get("runs_suspended_total", workflow="metered", status="sleeping") >= 1
+    assert m.get("step_attempts_total", workflow="metered", step="test_worker_metrics_and_stats"
+                 ".<locals>.flaky", outcome="retrying") == 1
+    assert m.get("step_attempts_total", workflow="metered", step="test_worker_metrics_and_stats"
+                 ".<locals>.flaky", outcome="completed") == 1
+    assert m.get("runs_claimed_total", workflow="metered") >= 2
+    assert m.get("runs_in_flight") == 0
+
+    stats = await flow.stats()
+    assert {"queue": "default", "workflow": "metered", "status": "completed", "count": 1} in stats["runs"]
+    assert stats["expired_leases"] == 0
+
+    text = await collect(flow, w)
+    assert '# TYPE pgreplay_flow_runs gauge' in text
+    assert 'pgreplay_flow_runs{queue="default",status="completed",workflow="metered"} 1' in text
+    assert 'pgreplay_flow_runs_finished_total{status="completed",workflow="metered"} 1' in text
+    assert "pgreplay_flow_step_attempt_seconds_count" in text
+
+
+async def test_metrics_http_endpoint(flow, start_worker):
+    w = start_worker()
+    server = await serve_metrics(flow, w, port=0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async def get(path):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            await writer.drain()
+            data = await reader.read()
+            writer.close()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
+            return data.decode()
+
+        ok = await get("/metrics")
+        assert ok.startswith("HTTP/1.1 200 OK")
+        assert "pgreplay_flow_expired_leases 0" in ok
+        assert "pgreplay_flow_runs_in_flight 0" in ok
+        assert (await get("/nope")).startswith("HTTP/1.1 404")
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_parent_recovering_after_lease_loss_reuses_child(flow, start_worker, schema):

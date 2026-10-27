@@ -12,10 +12,13 @@ from .errors import (
     WorkflowNotFound,
 )
 from .flow import Flow, ReplayReport, Worker
+from .metrics import Metrics, serve_metrics
 from .retry import NO_RETRY, RetryPolicy
 
 __all__ = [
     "ChildFailed",
+    "Metrics",
+    "serve_metrics",
     "NO_RETRY",
     "Flow",
     "FlowError",

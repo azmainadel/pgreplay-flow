@@ -31,6 +31,7 @@ from .errors import (
     WorkflowFailed,
     WorkflowNotFound,
 )
+from .metrics import Metrics
 from .retry import RetryPolicy
 from .schema import ddl, validate_schema_name
 from .serde import error_info, normalize
@@ -385,6 +386,40 @@ class Flow:
             )
             return await cur.fetchall()
 
+    async def stats(self) -> dict[str, Any]:
+        """Database-wide gauges: run counts by (queue, workflow, status), age of
+        the oldest unclaimed runnable run per queue, and expired leases."""
+        s = sql.Identifier(self.schema)
+        async with self.pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                sql.SQL("""
+                SELECT queue, workflow, status, count(*)::int AS count
+                FROM {0}.runs GROUP BY 1, 2, 3 ORDER BY 1, 2, 3
+                """).format(s)
+            )
+            runs = await cur.fetchall()
+            await cur.execute(
+                sql.SQL("""
+                SELECT queue, extract(epoch FROM now() - min(ready_at))::float8 AS lag
+                FROM {0}.runs
+                WHERE status IN ('pending','sleeping','waiting') AND ready_at <= now()
+                GROUP BY queue
+                """).format(s)
+            )
+            lag = {r["queue"]: r["lag"] for r in await cur.fetchall()}
+            for q in {r["queue"] for r in runs}:
+                lag.setdefault(q, 0.0)
+            await cur.execute(
+                sql.SQL("""
+                SELECT count(*)::int AS n FROM {0}.runs
+                WHERE status = 'running' AND lease_expires_at < now()
+                """).format(s)
+            )
+            row = await cur.fetchone()
+        return {"runs": runs, "queue_lag_seconds": lag,
+                "expired_leases": row["n"] if row else 0}
+
     # -- retention ----------------------------------------------------------------
 
     async def purge(
@@ -521,6 +556,7 @@ class _Claim:
     args: dict[str, Any]
     token: uuid.UUID
     db_now: float
+    recovered: bool = False
 
 
 @dataclass
@@ -550,6 +586,8 @@ class Worker:
         self._stopping = asyncio.Event()
         self._running: dict[uuid.UUID, asyncio.Task] = {}
         self._slots = asyncio.Semaphore(self.concurrency)
+        self.metrics = Metrics()
+        self.metrics.set("runs_in_flight", 0)
 
     # -- public ---------------------------------------------------------------
 
@@ -576,6 +614,10 @@ class Worker:
                         await self._slots.acquire()
                         t = asyncio.create_task(self._execute(c), name=f"run-{c.run_id}")
                         self._running[c.run_id] = t
+                        self.metrics.inc("runs_claimed_total", workflow=c.workflow)
+                        if c.recovered:
+                            self.metrics.inc("runs_recovered_total", workflow=c.workflow)
+                        self.metrics.set("runs_in_flight", len(self._running))
                         t.add_done_callback(lambda _t, rid=c.run_id: self._done(rid))
                 if claimed and claimed == free:
                     continue  # maybe more work queued
@@ -604,6 +646,7 @@ class Worker:
 
     def _done(self, run_id: uuid.UUID) -> None:
         self._running.pop(run_id, None)
+        self.metrics.set("runs_in_flight", len(self._running))
         self._slots.release()
         self._wake.set()
 
@@ -633,6 +676,7 @@ class Worker:
             try:
                 n = await self.flow.purge(self.purge_after)
                 if n:
+                    self.metrics.inc("runs_purged_total", n)
                     log.info("purged %d finished runs", n)
             except psycopg.Error as e:
                 log.warning("purge failed: %s", e)
@@ -682,7 +726,7 @@ class Worker:
             cur = await conn.execute(
                 sql.SQL("""
                 WITH c AS (
-                    SELECT id FROM {0}.runs
+                    SELECT id, status AS prev_status FROM {0}.runs
                     WHERE queue = ANY(%s) AND workflow = ANY(%s) AND (
                           (status IN ('pending','sleeping','waiting') AND ready_at <= now())
                        OR (status = 'running' AND lease_expires_at < now()))
@@ -700,7 +744,7 @@ class Worker:
                     updated_at = now()
                 FROM c WHERE r.id = c.id
                 RETURNING r.id, r.workflow, r.args, r.lease_token,
-                          extract(epoch FROM now())::float8
+                          extract(epoch FROM now())::float8, c.prev_status = 'running'
                 """).format(sql.Identifier(self.flow.schema)),
                 (list(self.queues), list(self.flow.workflows), limit, self.worker_id,
                  self.lease_seconds),
@@ -712,20 +756,30 @@ class Worker:
 
     async def _execute(self, claim: _Claim) -> None:
         store = RunStore(self.flow.pool, self.flow.schema, claim.run_id, claim.token)
+        m, wf = self.metrics, claim.workflow
+        t0 = time.perf_counter()
         try:
-            await self._execute_inner(claim, store)
+            kind, status = await self._execute_inner(claim, store)
+            m.inc("runs_finished_total" if kind == "finished" else "runs_suspended_total",
+                  workflow=wf, status=status)
         except asyncio.CancelledError:
+            m.inc("runs_abandoned_total", workflow=wf, reason="shutdown")
             # Worker shutdown: hand the run back right away instead of waiting
             # for the lease to expire.
             with contextlib.suppress(Exception, LeaseLost, StoreUnavailable):
                 await asyncio.shield(store.release())
             raise
         except (LeaseLost, StoreUnavailable) as e:
+            reason = "lease_lost" if isinstance(e, LeaseLost) else "store_unavailable"
+            m.inc("runs_abandoned_total", workflow=wf, reason=reason)
             log.info("run %s abandoned: %r", claim.run_id, e)
         except Exception:
+            m.inc("runs_abandoned_total", workflow=wf, reason="internal_error")
             log.exception("internal error executing run %s", claim.run_id)
+        finally:
+            m.observe("run_execution_seconds", time.perf_counter() - t0, workflow=wf)
 
-    async def _execute_inner(self, claim: _Claim, store: RunStore) -> None:
+    async def _execute_inner(self, claim: _Claim, store: RunStore) -> tuple[str, str]:
         wf = self.flow.workflows[claim.workflow]
         journal = await self.flow._load_journal(claim.run_id)
         # Durable deadlines are compared against the database clock (ready_at
@@ -735,7 +789,7 @@ class Worker:
             run_id=claim.run_id, workflow=wf.name, journal=journal, store=store,
             default_retry=wf.retry, inline_wait_max=self.inline_wait_max,
             clock=lambda: time.time() + offset,
-            resolve=self.flow._child_ref,
+            resolve=self.flow._child_ref, metrics=self.metrics,
         )
         main = asyncio.get_running_loop().create_task(
             ctx._main(wf.fn, claim.args["args"], claim.args["kwargs"]),
@@ -748,8 +802,7 @@ class Worker:
         try:
             await asyncio.wait({main, quiet, lost_w}, return_when=asyncio.FIRST_COMPLETED)
             if main.done():
-                await self._finish(ctx, main, store)
-                return
+                return "finished", await self._finish(ctx, main, store)
             if lost.is_set():
                 raise LeaseLost()
             ctx.close()
@@ -759,6 +812,7 @@ class Worker:
             status, until = ctx.suspension()
             if not await store.suspend(status, until):
                 raise LeaseLost()
+            return "suspended", status
         finally:
             for t in (hb, quiet, lost_w):
                 t.cancel()
@@ -767,7 +821,7 @@ class Worker:
                 with contextlib.suppress(BaseException):
                     await main
 
-    async def _finish(self, ctx: WorkflowContext, main: asyncio.Task, store: RunStore) -> None:
+    async def _finish(self, ctx: WorkflowContext, main: asyncio.Task, store: RunStore) -> str:
         exc = main.exception() if not main.cancelled() else asyncio.CancelledError()
         if isinstance(exc, (LeaseLost, StoreUnavailable)):
             raise exc
@@ -776,13 +830,14 @@ class Worker:
                 ctx.assert_journal_consumed()
                 result = normalize(main.result())
             except (NonDeterminismError, TypeError) as e:
-                ok = await store.finish("failed", error=error_info(e))
+                status, ok = "failed", await store.finish("failed", error=error_info(e))
             else:
-                ok = await store.finish("completed", result=result)
+                status, ok = "completed", await store.finish("completed", result=result)
         else:
-            ok = await store.finish("failed", error=error_info(exc))
+            status, ok = "failed", await store.finish("failed", error=error_info(exc))
         if not ok:
             raise LeaseLost()
+        return status
 
     async def _heartbeat(self, store: RunStore, lost: asyncio.Event) -> None:
         interval = self.lease_seconds / 3

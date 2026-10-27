@@ -49,6 +49,7 @@ from .retry import RetryPolicy
 from .serde import error_info, normalize
 
 if TYPE_CHECKING:
+    from .metrics import Metrics
     from .store import RunStore
 
 T = TypeVar("T")
@@ -186,6 +187,7 @@ class WorkflowContext:
         inline_wait_max: float = 1.0,
         clock: Callable[[], float] = time.time,
         resolve: Callable[[Any], tuple[str, str]] | None = None,
+        metrics: Metrics | None = None,
     ):
         self.run_id = run_id
         self.workflow = workflow
@@ -195,6 +197,7 @@ class WorkflowContext:
         self._inline_wait_max = inline_wait_max
         self._clock = clock
         self._resolve = resolve
+        self._metrics = metrics
         self._root: _Scope | None = None
         self._seen: set[str] = set()
         # Quiescence tracking (live mode only).
@@ -381,11 +384,13 @@ class WorkflowContext:
             attempts += 1
             token = _STEP_INFO.set(StepInfo(self.run_id, key, name, attempts))
             exc: Exception | None = None
+            t0 = time.perf_counter()
             try:
                 if tx is not None:
                     fn, args, kwargs = tx
                     out, exc = await store.run_tx_step(key, kind, name, attempts, fn, args, kwargs)
                     if exc is None:
+                        self._attempt_done(name, "completed", t0)
                         return out
                 else:
                     assert call is not None
@@ -398,20 +403,29 @@ class WorkflowContext:
                         exc = e
                     else:
                         await store.put_step(key, kind, name, "completed", attempts, output=out)
+                        self._attempt_done(name, "completed", t0)
                         return out
             finally:
                 _STEP_INFO.reset(token)
 
             err = error_info(exc)
             if retry.should_retry(attempts, exc):
+                self._attempt_done(name, "retrying", t0)
                 retry_at = self._clock() + retry.delay(attempts)
                 await store.put_step(
                     key, kind, name, "retrying", attempts, error=err, output={"retry_at": retry_at}
                 )
                 await self._wait_until(key, "retry", retry_at)
                 continue
+            self._attempt_done(name, "failed", t0)
             await store.put_step(key, kind, name, "failed", attempts, error=err)
             raise StepFailed(name, err) from exc
+
+    def _attempt_done(self, name: str, outcome: str, t0: float) -> None:
+        if self._metrics is not None:
+            labels = {"workflow": self.workflow, "step": name}
+            self._metrics.inc("step_attempts_total", outcome=outcome, **labels)
+            self._metrics.observe("step_attempt_seconds", time.perf_counter() - t0, **labels)
 
     # -- child workflows ----------------------------------------------------
 
