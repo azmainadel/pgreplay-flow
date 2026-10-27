@@ -31,6 +31,7 @@ from .errors import (
     WorkflowFailed,
     WorkflowNotFound,
 )
+from .listener import ChannelListener
 from .metrics import Metrics
 from .retry import RetryPolicy
 from .schema import ddl, validate_schema_name
@@ -100,6 +101,9 @@ class Flow:
         self.workflows: dict[str, WorkflowDef] = {}
         self.wake_channel = f"{self.schema}_wake"
         self.done_channel = f"{self.schema}_done"
+        # result() waiters share one LISTEN connection, opened on first use.
+        self._done_listener: ChannelListener | None = None
+        self._done_waiters: dict[str, set[asyncio.Event]] = {}
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -109,6 +113,9 @@ class Flow:
             await self.migrate()
 
     async def close(self) -> None:
+        if self._done_listener is not None:
+            await self._done_listener.close()
+            self._done_listener = None
         await self.pool.close()
 
     async def __aenter__(self) -> Flow:
@@ -229,42 +236,63 @@ class Flow:
             )
             return await cur.fetchall()
 
+    def _notify_done(self, payload: str) -> None:
+        for ev in self._done_waiters.get(payload, ()):
+            ev.set()
+
+    def _wake_all_waiters(self) -> None:
+        # After a (re)connect, notifications may have been missed: re-check all.
+        for evs in self._done_waiters.values():
+            for ev in evs:
+                ev.set()
+
+    async def _ensure_done_listener(self) -> ChannelListener:
+        if self._done_listener is None:
+            self._done_listener = ChannelListener(
+                self.dsn, self.done_channel, self._notify_done, on_connect=self._wake_all_waiters
+            )
+        self._done_listener.start()
+        await self._done_listener.wait_started()
+        return self._done_listener
+
     async def result(self, run_id: uuid.UUID, *, timeout: float | None = None) -> Any:
         """Wait for a run to finish. Returns its result, or raises WorkflowFailed /
-        WorkflowCancelled / TimeoutError."""
+        WorkflowCancelled / TimeoutError.
+
+        All concurrent waiters share one LISTEN connection per Flow. If it is
+        down, waiting degrades to polling once a second.
+        """
         deadline = None if timeout is None else time.monotonic() + timeout
-        listener: AsyncConnection | None = None
+        key = str(run_id)
+        event = asyncio.Event()
+        # Register before the first status check: a notification that arrives
+        # between the check and the wait still sets the event (no lost wakeup).
+        self._done_waiters.setdefault(key, set()).add(event)
         try:
-            try:
-                listener = await AsyncConnection.connect(self.dsn, autocommit=True)
-                await listener.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.done_channel)))
-            except psycopg.OperationalError:
-                listener = None  # fall back to polling
+            listener = await self._ensure_done_listener()
             while True:
-                run = await self.get_run(run_id)  # checked after LISTEN: no lost wakeup
+                event.clear()
+                run = await self.get_run(run_id)
                 if run["status"] == "completed":
                     return run["result"]
                 if run["status"] == "failed":
                     raise WorkflowFailed(run_id, run["error"])
                 if run["status"] == "cancelled":
                     raise WorkflowCancelled(run_id)
-                wait = 1.0
+                # With a live listener this is only a safety net.
+                wait = 30.0 if listener.connected else 1.0
                 if deadline is not None:
                     wait = min(wait, deadline - time.monotonic())
                     if wait <= 0:
                         raise TimeoutError(f"run {run_id} still {run['status']}")
-                if listener is not None:
-                    try:
-                        async for n in listener.notifies(timeout=wait, stop_after=1):
-                            if n.payload != str(run_id):
-                                continue
-                    except psycopg.OperationalError:
-                        listener = None
-                else:
-                    await asyncio.sleep(wait)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(event.wait(), wait)
         finally:
-            if listener is not None:
-                await listener.close()
+            waiters = self._done_waiters.get(key)
+            if waiters is not None:
+                waiters.discard(event)
+                if not waiters:
+                    del self._done_waiters[key]
 
     async def run(self, workflow: WorkflowFn | str, *args: Any, timeout: float | None = None,
                   **kwargs: Any) -> Any:

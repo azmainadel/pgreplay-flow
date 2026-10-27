@@ -301,9 +301,12 @@ async def test_replay_detects_nondeterminism(flow, start_worker):
 
 
 async def test_replay_incomplete_run(flow):
+    def one():
+        return 1
+
     @flow.workflow(name="pending")
     async def wf(ctx):
-        return await ctx.step(lambda: 1)
+        return await ctx.step(one)
 
     run_id = await flow.start(wf)  # no worker: nothing journaled yet
     report = await flow.replay(run_id)
@@ -467,3 +470,34 @@ async def test_busy_branch_can_signal_its_waiting_sibling(flow, start_worker):
     start_worker(inline_wait_max=0.05)
     holder["id"] = await flow.start(wf)
     assert await flow.result(holder["id"], timeout=10) == "hello"
+
+
+async def test_concurrent_result_calls_share_one_listener(flow, start_worker):
+    """Regression: each result() used to open its own LISTEN connection."""
+    import psycopg
+
+    from tests.conftest import DSN
+
+    async def done_listeners() -> int:
+        async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as c:
+            cur = await c.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE query = %s",
+                (f'LISTEN "{flow.done_channel}"',),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return row[0]
+
+    @flow.workflow(name="gated")
+    async def gated(ctx, i):
+        return [i, await ctx.wait_for_signal("go")]
+
+    ids = [await flow.start(gated, i) for i in range(40)]
+    waiters = [asyncio.create_task(flow.result(r, timeout=20)) for r in ids]
+    await asyncio.sleep(0.5)
+    assert await done_listeners() == 1  # one shared listener, not 40
+
+    start_worker(inline_wait_max=0.05)
+    for r in ids:
+        await flow.send_signal(r, "go", "ok")
+    assert await asyncio.gather(*waiters) == [[i, "ok"] for i in range(40)]
