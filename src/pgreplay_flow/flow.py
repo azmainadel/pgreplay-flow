@@ -547,10 +547,15 @@ class Flow:
                             ops_replayed=len(ctx._seen))
 
     async def fork(self, run_id: uuid.UUID, *, keep: int | None = None) -> uuid.UUID:
-        """Start a new run of the same workflow and arguments that reuses the first
-        `keep` journal entries (in write order; default: all completed/failed
-        entries). Execution resumes live from that point, e.g. after a bug fix.
+        """Start a new run of the same workflow and arguments that reuses the old
+        run's completed journal entries, in write order, up to the first entry
+        that did not complete (failed, retrying, waiting) and at most `keep`
+        entries. Everything after that runs live, e.g. with fixed code.
+
+        keep=None reuses as much as possible; keep=0 reruns from scratch.
         """
+        if keep is not None and keep < 0:
+            raise ValueError("keep must be >= 0")
         run = await self.get_run(run_id)
         new_id = uuid.uuid4()
         async with self.pool.connection() as conn, conn.transaction():
@@ -565,13 +570,16 @@ class Flow:
                 sql.SQL("""
                 INSERT INTO {0}.steps (run_id, key, kind, name, status, output, error, attempts)
                 SELECT %s, key, kind, name, status, output, error, attempts FROM (
-                    SELECT * FROM {0}.steps WHERE run_id = %s ORDER BY ord
-                    LIMIT %s
-                ) kept
-                WHERE status IN ('completed', 'failed')
+                    SELECT *,
+                           -- true while every entry so far (by ord) completed
+                           bool_and(status = 'completed') OVER (ORDER BY ord) AS clean,
+                           row_number() OVER (ORDER BY ord) AS n
+                    FROM {0}.steps WHERE run_id = %s
+                ) x
+                WHERE clean AND (%s::int IS NULL OR n <= %s)
                 ORDER BY ord
                 """).format(sql.Identifier(self.schema)),
-                (new_id, run["id"], keep),
+                (new_id, run["id"], keep, keep),
             )
             await conn.execute("SELECT pg_notify(%s, '')", (self.wake_channel,))
         return new_id

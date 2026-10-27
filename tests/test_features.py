@@ -349,9 +349,13 @@ async def test_metrics_http_endpoint(flow, start_worker):
         await server.wait_closed()
 
 
-async def test_parent_recovering_after_lease_loss_reuses_child(flow, start_worker, schema):
-    """Worker dies right after the child was created: recovery must attach to
-    the same child, not start a second one."""
+async def test_parent_recovering_after_crash_reuses_child(flow, start_worker, monkeypatch):
+    """The parent's worker dies right after the child run was created (the
+    start_child transaction committed, nothing after it did). Recovery must
+    reattach to that same child, not start a second one."""
+    from pgreplay_flow.errors import StoreUnavailable
+    from pgreplay_flow.store import RunStore
+
     kid_runs = []
 
     async def work():
@@ -360,31 +364,27 @@ async def test_parent_recovering_after_lease_loss_reuses_child(flow, start_worke
 
     @flow.workflow(name="kid2")
     async def kid2(ctx):
-        await ctx.sleep(0.5)
         return await ctx.step(work)
 
     @flow.workflow(name="dad2")
     async def dad2(ctx):
         return await ctx.child(kid2)
 
+    crashed = []
+    real_child_outcome = RunStore.child_outcome
+
+    async def crash_once(self, child_id):
+        if not crashed:
+            crashed.append(child_id)
+            raise StoreUnavailable("simulated crash after start_child committed")
+        return await real_child_outcome(self, child_id)
+
+    monkeypatch.setattr(RunStore, "child_outcome", crash_once)
+    start_worker(lease_seconds=1.0)
     run_id = await flow.start(dad2)
-    w1 = start_worker(lease_seconds=60, inline_wait_max=2.0, queues=("default",))
-    # Wait until the child exists, then make w1 "vanish": stop it without
-    # releasing, and expire the parent's lease as if its process had died.
-    for _ in range(100):
-        if await flow.list_runs(parent_id=run_id):
-            break
-        await asyncio.sleep(0.02)
-    w1._stopping.set()
-    async with flow.pool.connection() as conn:
-        await conn.execute(
-            sql.SQL("""
-                UPDATE {}.runs SET lease_expires_at = now() - interval '1s'
-                WHERE id = %s AND status = 'running'
-            """).format(sql.Identifier(schema)),
-            (run_id,),
-        )
-    start_worker(inline_wait_max=0.05)
     assert await flow.result(run_id, timeout=15) == "kid-done"
-    assert len(await flow.list_runs(parent_id=run_id)) == 1
+
+    [child] = await flow.list_runs(parent_id=run_id)
+    assert crashed == [child["id"]]
+    assert (await flow.get_run(run_id))["recoveries"] == 1
     assert kid_runs == [1]

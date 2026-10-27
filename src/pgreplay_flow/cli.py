@@ -397,7 +397,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = cmd("fork", cmd_fork, "copy a run's journal into a new run and resume it")
     sp.add_argument("run_id", type=_parse_uuid)
-    sp.add_argument("--keep", type=int, help="reuse only the first N journal entries")
+    sp.add_argument("--keep", type=int,
+                    help="reuse at most the first N completed entries (0 = rerun everything)")
 
     sp = cmd("purge", cmd_purge, "delete finished runs older than a duration")
     sp.add_argument("--older-than", type=_parse_duration, required=True, help="e.g. 30d, 12h")

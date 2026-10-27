@@ -337,10 +337,16 @@ async def test_fork_resumes_after_fix(flow, start_worker):
         await flow.result(run_id, timeout=10)
 
     fixed["v"] = True
-    fork_id = await flow.fork(run_id, keep=1)  # keep `expensive`, redo `buggy`
+    # Default fork: keep what succeeded (`expensive`), rerun what failed (`buggy`).
+    fork_id = await flow.fork(run_id)
     assert await flow.result(fork_id, timeout=10) == 42
     assert counts["expensive"] == 1
     assert (await flow.get_run(fork_id))["forked_from"] == run_id
+
+    # keep=0 reruns everything.
+    rerun_id = await flow.fork(run_id, keep=0)
+    assert await flow.result(rerun_id, timeout=10) == 42
+    assert counts["expensive"] == 2
 
 
 async def test_many_workers_each_run_executes_once(flow, start_worker):
