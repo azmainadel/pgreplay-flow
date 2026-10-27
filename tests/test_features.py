@@ -1,4 +1,4 @@
-"""Child workflows."""
+"""Child workflows and retention purge."""
 
 import asyncio
 import uuid
@@ -182,6 +182,96 @@ async def test_nested_children(flow, start_worker):
 
     start_worker(concurrency=3)
     assert await flow.run(root, timeout=20) == 33
+
+
+# -- retention ---------------------------------------------------------------------
+
+
+async def _age_runs(flow, schema, seconds):
+    async with flow.pool.connection() as conn:
+        await conn.execute(
+            sql.SQL("""
+                UPDATE {}.runs SET finished_at = finished_at - make_interval(secs => %s)
+                WHERE finished_at IS NOT NULL
+            """).format(sql.Identifier(schema)),
+            (seconds,),
+        )
+
+
+async def test_purge_deletes_only_old_terminal_runs(flow, start_worker, schema):
+    @flow.workflow(name="quick")
+    async def quick(ctx, x):
+        return await ctx.step(lambda: x)
+
+    @flow.workflow(name="parked")
+    async def parked(ctx):
+        await ctx.wait_for_signal("go")
+
+    start_worker(inline_wait_max=0.05)
+    done = [await flow.start(quick, i) for i in range(5)]
+    for r in done:
+        await flow.result(r, timeout=10)
+    waiting = await flow.start(parked)
+    await flow.send_signal(waiting, "unrelated")
+
+    assert await flow.purge(3600) == 0  # nothing is old yet
+    await _age_runs(flow, schema, 7200)
+    fresh = await flow.start(quick, 99)
+    await flow.result(fresh, timeout=10)
+
+    assert await flow.purge(3600, batch_size=2) == 5  # several batches
+    remaining = {r["id"] for r in await flow.list_runs(limit=100)}
+    assert remaining == {waiting, fresh}
+    async with flow.pool.connection() as conn:
+        for table in ("steps", "signals"):
+            cur = await conn.execute(
+                sql.SQL("SELECT count(DISTINCT run_id) FROM {}.{}").format(
+                    sql.Identifier(schema), sql.Identifier(table)
+                )
+            )
+            n = (await cur.fetchone())[0]
+            assert n <= 2, table  # journals of purged runs went with them
+
+
+async def test_purge_keeps_child_of_unfinished_parent(flow, start_worker, schema):
+    @flow.workflow(name="tiny")
+    async def tiny(ctx):
+        return 1
+
+    @flow.workflow(name="slow_parent")
+    async def slow_parent(ctx):
+        await ctx.child(tiny)
+        await ctx.wait_for_signal("finish")
+
+    start_worker(inline_wait_max=0.05)
+    run_id = await flow.start(slow_parent)
+    for _ in range(100):
+        if (await flow.get_run(run_id))["status"] == "waiting" and await flow.list_runs(
+            parent_id=run_id, status="completed"
+        ):
+            break
+        await asyncio.sleep(0.05)
+    await _age_runs(flow, schema, 7200)
+    assert await flow.purge(60) == 0
+    with pytest.raises(ValueError):
+        await flow.purge(60, statuses=("running",))
+
+
+async def test_worker_background_purge(flow, start_worker, schema):
+    @flow.workflow(name="old")
+    async def old(ctx):
+        return 1
+
+    start_worker()
+    run_id = await flow.start(old)
+    await flow.result(run_id, timeout=10)
+    await _age_runs(flow, schema, 100)
+    start_worker(purge_after=50, purge_interval=0.2)
+    for _ in range(50):
+        if not await flow.list_runs():
+            break
+        await asyncio.sleep(0.1)
+    assert await flow.list_runs() == []
 
 
 async def test_parent_recovering_after_lease_loss_reuses_child(flow, start_worker, schema):

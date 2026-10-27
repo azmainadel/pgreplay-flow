@@ -81,8 +81,8 @@ CREATE TABLE IF NOT EXISTS {s}.signals (
 CREATE INDEX IF NOT EXISTS signals_pending_idx
     ON {s}.signals (run_id, name, id) WHERE consumed_key IS NULL;
 
--- v2: child workflows. No foreign key on purpose: parent and child runs have
--- independent lifecycles (a child's result is copied into the parent's journal).
+-- v2: child workflows. No foreign key on purpose: parent and child are purged
+-- independently (a child's result is copied into the parent's journal).
 ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS parent_id  uuid;
 ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS parent_key text;
 -- attached: started with ctx.child() (parent waits; cancelled with parent).
@@ -91,6 +91,11 @@ ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS attached   boolean NOT NULL DEFAUL
 
 CREATE INDEX IF NOT EXISTS runs_parent_idx
     ON {s}.runs (parent_id) WHERE parent_id IS NOT NULL;
+
+-- v2: retention cleanup scans terminal runs by age.
+CREATE INDEX IF NOT EXISTS runs_finished_idx
+    ON {s}.runs (finished_at)
+    WHERE status IN ('completed','failed','cancelled');
 """
 
 

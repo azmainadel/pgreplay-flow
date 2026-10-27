@@ -385,6 +385,53 @@ class Flow:
             )
             return await cur.fetchall()
 
+    # -- retention ----------------------------------------------------------------
+
+    async def purge(
+        self,
+        older_than: float,
+        *,
+        workflow: str | None = None,
+        statuses: tuple[str, ...] = TERMINAL,
+        batch_size: int = 1000,
+    ) -> int:
+        """Delete finished runs (with their journals and signals) whose
+        finished_at is more than `older_than` seconds ago. Returns the count.
+
+        Runs in small batches with SKIP LOCKED, so it is safe to call from many
+        workers at once. An attached child is kept while its parent is still
+        running, because the parent has not copied its result yet.
+        """
+        bad = set(statuses) - set(TERMINAL)
+        if bad:
+            raise ValueError(f"can only purge terminal statuses, not {sorted(bad)}")
+        if older_than < 0:
+            raise ValueError("older_than must be >= 0")
+        total = 0
+        while True:
+            async with self.pool.connection() as conn, conn.transaction():
+                cur = await conn.execute(
+                    sql.SQL("""
+                    DELETE FROM {0}.runs WHERE id IN (
+                        SELECT r.id FROM {0}.runs r
+                        WHERE r.status = ANY(%s)
+                          AND r.finished_at < now() - make_interval(secs => %s)
+                          AND (%s::text IS NULL OR r.workflow = %s)
+                          AND NOT (r.attached AND EXISTS (
+                                SELECT 1 FROM {0}.runs p
+                                WHERE p.id = r.parent_id
+                                  AND p.status NOT IN ('completed','failed','cancelled')))
+                        ORDER BY r.finished_at
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED)
+                    """).format(sql.Identifier(self.schema)),
+                    (list(statuses), older_than, workflow, workflow, batch_size),
+                )
+                n = cur.rowcount
+            total += n
+            if n < batch_size:
+                return total
+
     # -- replay and fork --------------------------------------------------------
 
     async def _load_journal(self, run_id: uuid.UUID) -> dict[str, dict[str, Any]]:
@@ -490,6 +537,10 @@ class Worker:
     lease_seconds: float = 30.0
     poll_interval: float = 5.0
     inline_wait_max: float = 1.0
+    # Retention: if set, this worker periodically deletes runs that finished
+    # more than purge_after seconds ago (see Flow.purge).
+    purge_after: float | None = None
+    purge_interval: float = 3600.0
     worker_id: str = field(
         default_factory=lambda: f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     )
@@ -505,6 +556,10 @@ class Worker:
     async def run(self) -> None:
         """Run until stop() is called (or the task is cancelled)."""
         listener = asyncio.create_task(self._listen(), name="pgreplay-flow-listener")
+        purger = (
+            asyncio.create_task(self._purge_loop(), name="pgreplay-flow-purge")
+            if self.purge_after is not None else None
+        )
         try:
             while not self._stopping.is_set():
                 self._wake.clear()
@@ -527,9 +582,13 @@ class Worker:
                 await self._idle(free_slots=bool(self._free_slots()))
         finally:
             listener.cancel()
+            if purger is not None:
+                purger.cancel()
             await self._shutdown(grace=0)
-            with contextlib.suppress(asyncio.CancelledError):
-                await listener
+            for t in (listener, purger):
+                if t is not None:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
 
     async def stop(self, *, grace: float = 10.0) -> None:
         """Stop claiming; let in-flight runs finish for up to `grace` seconds,
@@ -567,6 +626,17 @@ class Worker:
                     timeout = max(0.0, min(timeout, nxt))
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._wake.wait(), timeout)
+
+    async def _purge_loop(self) -> None:
+        assert self.purge_after is not None
+        while True:
+            try:
+                n = await self.flow.purge(self.purge_after)
+                if n:
+                    log.info("purged %d finished runs", n)
+            except psycopg.Error as e:
+                log.warning("purge failed: %s", e)
+            await asyncio.sleep(self.purge_interval)
 
     async def _listen(self) -> None:
         backoff = 0.5
