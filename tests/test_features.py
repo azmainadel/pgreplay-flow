@@ -10,6 +10,7 @@ from psycopg import sql
 from pgreplay_flow import (
     NO_RETRY,
     ChildFailed,
+    RetryPolicy,
     StepFailed,
     WorkflowCancelled,
     WorkflowFailed,
@@ -293,17 +294,12 @@ async def test_worker_metrics_and_stats(flow, start_worker):
             raise RuntimeError("once")
         return "ok"
 
-    @flow.workflow(name="metered")
+    @flow.workflow(name="metered", retry=RetryPolicy(max_attempts=3, initial_delay=0.01))
     async def metered(ctx):
         await ctx.sleep(0.3)
         return await ctx.step(flaky)
 
     w = start_worker(inline_wait_max=0.05)
-    from pgreplay_flow import RetryPolicy
-
-    flow.workflows["metered"] = flow.workflows["metered"].__class__(
-        "metered", metered, "default", RetryPolicy(max_attempts=3, initial_delay=0.01)
-    )
     run_id = await flow.start(metered)
     assert await flow.result(run_id, timeout=10) == "ok"
 

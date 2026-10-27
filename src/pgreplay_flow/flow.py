@@ -123,7 +123,7 @@ class Flow:
         async with self.pool.connection() as conn, conn.transaction():
             # Serialize concurrent migrations (CREATE ... IF NOT EXISTS can race).
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.schema,))
-            await conn.execute(ddl(self.schema))  # type: ignore[arg-type]
+            await conn.execute(ddl(self.schema))
 
     # -- registration ---------------------------------------------------------
 
@@ -445,17 +445,20 @@ class Flow:
     # -- retention ----------------------------------------------------------------
 
     # Which runs retention may delete. Shared by purge() and count_purgeable()
-    # so a dry run always agrees with the real thing. {0} = schema, r = the run.
+    # so a dry run always agrees with the real thing. `r` is the candidate run.
     _PURGEABLE = """
         r.status = ANY(%s)
         AND r.finished_at < now() - make_interval(secs => %s)
         AND (%s::text IS NULL OR r.workflow = %s)
         -- an attached child is kept until its parent has copied its result
         AND NOT (r.attached AND EXISTS (
-              SELECT 1 FROM {0}.runs p
+              SELECT 1 FROM {s}.runs p
               WHERE p.id = r.parent_id
                 AND p.status NOT IN ('completed','failed','cancelled')))
     """
+
+    def _purgeable_sql(self) -> sql.Composed:
+        return sql.SQL(self._PURGEABLE).format(s=sql.Identifier(self.schema))
 
     @staticmethod
     def _purge_params(
@@ -479,8 +482,8 @@ class Flow:
         params = self._purge_params(older_than, workflow, statuses)
         async with self.pool.connection() as conn:
             cur = await conn.execute(
-                sql.SQL("SELECT count(*) FROM {0}.runs r WHERE " + self._PURGEABLE).format(
-                    sql.Identifier(self.schema)
+                sql.SQL("SELECT count(*) FROM {s}.runs r WHERE {cond}").format(
+                    s=sql.Identifier(self.schema), cond=self._purgeable_sql()
                 ),
                 params,
             )
@@ -503,11 +506,11 @@ class Flow:
         running, because the parent has not copied its result yet.
         """
         params = self._purge_params(older_than, workflow, statuses)
-        stmt = sql.SQL(
-            "DELETE FROM {0}.runs WHERE id IN ("
-            " SELECT r.id FROM {0}.runs r WHERE " + self._PURGEABLE +
-            " ORDER BY r.finished_at LIMIT %s FOR UPDATE SKIP LOCKED)"
-        ).format(sql.Identifier(self.schema))
+        stmt = sql.SQL("""
+            DELETE FROM {s}.runs WHERE id IN (
+                SELECT r.id FROM {s}.runs r WHERE {cond}
+                ORDER BY r.finished_at LIMIT %s FOR UPDATE SKIP LOCKED)
+        """).format(s=sql.Identifier(self.schema), cond=self._purgeable_sql())
         total = 0
         while True:
             async with self.pool.connection() as conn, conn.transaction():

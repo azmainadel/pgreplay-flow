@@ -85,19 +85,6 @@ class Metrics:
             s[0] += value
             s[1] += 1
 
-    def snapshot(self) -> dict[str, Any]:
-        """Plain-dict view, e.g. for tests or JSON logging."""
-        with self._lock:
-            return {
-                "counters": {n: {dict(k).__repr__(): v for k, v in s.items()}
-                             for n, s in self._counters.items()},
-                "gauges": {n: {dict(k).__repr__(): v for k, v in s.items()}
-                           for n, s in self._gauges.items()},
-                "summaries": {n: {dict(k).__repr__(): {"sum": v[0], "count": v[1]}
-                                  for k, v in s.items()}
-                              for n, s in self._summaries.items()},
-            }
-
     def get(self, name: str, **labels: Any) -> float:
         """Current value of a counter or gauge series (0 if absent)."""
         key = _labels(labels)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from psycopg import sql
+
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
@@ -104,5 +106,6 @@ CREATE INDEX IF NOT EXISTS runs_finished_idx
 """
 
 
-def ddl(schema: str) -> str:
-    return DDL.format(s=validate_schema_name(schema))
+def ddl(schema: str) -> sql.Composed:
+    # The schema is validated and then quoted as an identifier, never pasted in.
+    return sql.SQL(DDL).format(s=sql.Identifier(validate_schema_name(schema)))

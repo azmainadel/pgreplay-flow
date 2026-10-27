@@ -293,8 +293,8 @@ async def test_replay_detects_nondeterminism(flow, start_worker):
     async def v2(ctx):
         return await ctx.step(b)
 
-    flow.workflows["evolve"] = flow.workflows["evolve"].__class__("evolve", v2, "default",
-                                                                   flow.default_retry)
+    del flow.workflows["evolve"]
+    flow.workflow(name="evolve")(v2)
     bad = await flow.replay(run_id)
     assert bad.outcome == "nondeterministic"
     assert NonDeterminismError.__name__ in bad.error["type"]

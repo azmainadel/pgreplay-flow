@@ -221,7 +221,7 @@ Finished jobs are kept until you clean them up: `pgreplay-flow worker --purge-af
 | `signal <run-id> <name> [json]` | Send a signal |
 | `cancel <run-id>` | Cancel a run and the child runs it's waiting on |
 | `replay <run-id>` | Re-run against recorded history, no side effects |
-| `fork <run-id>` | New run that reuses the old one's finished steps (`--keep N` to reuse only the first N) |
+| `fork <run-id>` | New run that reuses the old one's successful steps and re-runs from the first one that didn't succeed (`--keep N` caps reuse at N; `--keep 0` re-runs everything) |
 | `purge --older-than 30d` | Delete old finished runs (`--dry-run` to preview) |
 | `stats` | Counts per status, queue lag (how long the oldest job has waited); `--format prometheus` or `--format json` |
 
@@ -271,7 +271,7 @@ While a worker runs a job, it holds a **lease** with a unique token. If the work
 ```bash
 docker compose up -d     # Postgres 17 on localhost:54329
 uv sync
-uv run pytest            # 38 tests, including one that kill -9s a real worker mid-step
+uv run pytest            # 42 tests, including one that kill -9s a real worker mid-step
 ```
 
 `examples/agent_pipeline.py` is a bigger example: parallel LLM calls with retries, a durable sleep, and a transactional write.
