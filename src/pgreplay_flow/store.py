@@ -161,6 +161,20 @@ class RunStore:
 
     async def finish(self, status: str, result: Any = None, error: Any = None) -> bool:
         async with self._conn() as conn, conn.transaction():
+            # Lock order is always parent row -> child row (cancel() cascades in
+            # the same order), so finish() and cancel() cannot deadlock.
+            cur = await conn.execute(
+                sql.SQL("SELECT parent_id, attached FROM {0}.runs WHERE id = %s").format(sql.Identifier(self.s)), (self.run_id,)
+            )
+            row = await cur.fetchone()
+            parent_id = row[0] if row is not None and row[1] else None
+            if parent_id is not None:
+                # Locking the parent serializes us against its suspend(): either
+                # it is already 'waiting' (we wake it below) or its suspend runs
+                # after we commit and sees this child as terminal.
+                await conn.execute(
+                    sql.SQL("SELECT 1 FROM {0}.runs WHERE id = %s FOR UPDATE").format(sql.Identifier(self.s)), (parent_id,)
+                )
             cur = await conn.execute(
                 sql.SQL("""
                 UPDATE {0}.runs
@@ -175,7 +189,49 @@ class RunStore:
                 await conn.execute(
                     "SELECT pg_notify(%s, %s)", (f"{self.s}_done", str(self.run_id))
                 )
+                if parent_id is not None:
+                    await conn.execute(
+                        sql.SQL("""
+                        UPDATE {0}.runs SET ready_at = now(), updated_at = now()
+                        WHERE id = %s AND status IN ('waiting','sleeping')
+                        """).format(sql.Identifier(self.s)),
+                        (parent_id,),
+                    )
+                    await conn.execute("SELECT pg_notify(%s, %s)", (f"{self.s}_wake", ""))
             return ok
+
+    async def start_child(
+        self, key: str, kind: str, name: str, queue: str, child_id: uuid.UUID, args: Any
+    ) -> None:
+        """Create the child run and the parent's journal entry atomically.
+
+        The child id is deterministic, so if this transaction commits and the
+        worker dies, re-execution finds the entry and never creates a second child.
+        """
+        attached = kind == "child"
+        async with self._conn() as conn, conn.transaction():
+            await self._fence(conn)
+            await conn.execute(
+                sql.SQL("""
+                INSERT INTO {0}.runs (id, workflow, queue, args, parent_id, parent_key, attached)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
+                """).format(sql.Identifier(self.s)),
+                (child_id, name, queue, Jsonb(args), self.run_id, key, attached),
+            )
+            await self._upsert(
+                conn, key, kind, name, "pending" if attached else "completed", 1,
+                output={"child_id": str(child_id)},
+            )
+            await conn.execute("SELECT pg_notify(%s, %s)", (f"{self.s}_wake", ""))
+
+    async def child_outcome(self, child_id: uuid.UUID) -> tuple[str, Any, Any] | None:
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                sql.SQL("SELECT status, result, error FROM {0}.runs WHERE id = %s").format(sql.Identifier(self.s)), (child_id,)
+            )
+            row = await cur.fetchone()
+            return None if row is None else (row[0], row[1], row[2])
 
     async def suspend(self, status: str, until: float | None) -> bool:
         async with self._conn() as conn, conn.transaction():
@@ -196,18 +252,26 @@ class RunStore:
             )
             if await cur.fetchone() is None:
                 return False
-            # Statement 2: wake immediately if an awaited signal is already buffered.
+            # Statement 2: wake immediately if what we wait on already happened:
+            # a buffered signal, or an attached child that finished meanwhile.
             await conn.execute(
                 sql.SQL("""
                 UPDATE {0}.runs SET ready_at = now()
-                WHERE id = %s AND EXISTS (
-                    SELECT 1 FROM {0}.signals sg
-                    JOIN {0}.steps st
-                      ON st.run_id = sg.run_id AND st.kind = 'signal'
-                     AND st.status = 'pending' AND st.name = sg.name
-                    WHERE sg.run_id = %s AND sg.consumed_key IS NULL)
+                WHERE id = %s AND (
+                    EXISTS (
+                        SELECT 1 FROM {0}.signals sg
+                        JOIN {0}.steps st
+                          ON st.run_id = sg.run_id AND st.kind = 'signal'
+                         AND st.status = 'pending' AND st.name = sg.name
+                        WHERE sg.run_id = %s AND sg.consumed_key IS NULL)
+                 OR EXISTS (
+                        SELECT 1 FROM {0}.steps st
+                        LEFT JOIN {0}.runs ch ON ch.id = (st.output->>'child_id')::uuid
+                        WHERE st.run_id = %s AND st.kind = 'child' AND st.status = 'pending'
+                          AND (ch.id IS NULL
+                               OR ch.status IN ('completed','failed','cancelled'))))
                 """).format(sql.Identifier(self.s)),
-                (self.run_id, self.run_id),
+                (self.run_id, self.run_id, self.run_id),
             )
             await conn.execute("SELECT pg_notify(%s, %s)", (f"{self.s}_wake", ""))
             return True

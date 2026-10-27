@@ -52,6 +52,19 @@ class WorkflowCancelled(FlowError):
         super().__init__(f"run {run_id} was cancelled")
 
 
+class ChildFailed(StepFailed):
+    """A child workflow awaited with ctx.child() failed or was cancelled."""
+
+    def __init__(self, workflow: str, child_id: uuid.UUID, error: dict[str, Any]):
+        self.child_id = child_id
+        super().__init__(workflow, error)
+        self.args = (f"child {workflow!r} ({child_id}) failed: "
+                     f"{self.error_type}: {self.error_message}",)
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
 # --- Internal control flow -------------------------------------------------
 # These derive from BaseException so that `except Exception` in user workflow
 # code cannot accidentally swallow them (same reasoning as CancelledError).

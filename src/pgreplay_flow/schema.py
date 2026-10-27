@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS {s}.steps (
     run_id      uuid    NOT NULL REFERENCES {s}.runs(id) ON DELETE CASCADE,
     key         text    NOT NULL,
     ord         bigserial,
-    kind        text    NOT NULL,   -- step | tx_step | sleep | signal | now | uuid | random
+    kind        text    NOT NULL,   -- step | tx_step | sleep | signal | child | now | uuid | random
     name        text    NOT NULL,
     status      text    NOT NULL CHECK (status IN ('completed','failed','retrying','pending')),
     output      jsonb,
@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS {s}.signals (
 CREATE INDEX IF NOT EXISTS signals_pending_idx
     ON {s}.signals (run_id, name, id) WHERE consumed_key IS NULL;
 
+-- v2: child workflows. No foreign key on purpose: parent and child runs have
+-- independent lifecycles (a child's result is copied into the parent's journal).
+ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS parent_id  uuid;
+ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS parent_key text;
+-- attached: started with ctx.child() (parent waits; cancelled with parent).
+-- Detached children (ctx.start_child) keep parent_id only as lineage.
+ALTER TABLE {s}.runs ADD COLUMN IF NOT EXISTS attached   boolean NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS runs_parent_idx
+    ON {s}.runs (parent_id) WHERE parent_id IS NOT NULL;
 """
 
 

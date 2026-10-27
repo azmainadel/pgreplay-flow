@@ -38,6 +38,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from .errors import (
+    ChildFailed,
     JournalExhausted,
     LeaseLost,
     NonDeterminismError,
@@ -60,6 +61,11 @@ _SCOPE: contextvars.ContextVar[_Scope | None] = contextvars.ContextVar(
 )
 
 _PASSTHROUGH = (asyncio.CancelledError, LeaseLost, StoreUnavailable, JournalExhausted)
+
+# Child run ids are derived from (parent run id, op key), so re-executing the
+# parent after a crash finds the same child instead of starting a second one.
+_CHILD_NS = uuid.UUID("6f1c6b4e-5f0e-4d8a-9a51-0c9b1f3e2d77")
+_TERMINAL = ("completed", "failed", "cancelled")
 
 
 @dataclass(frozen=True)
@@ -179,6 +185,7 @@ class WorkflowContext:
         default_retry: RetryPolicy,
         inline_wait_max: float = 1.0,
         clock: Callable[[], float] = time.time,
+        resolve: Callable[[Any], tuple[str, str]] | None = None,
     ):
         self.run_id = run_id
         self.workflow = workflow
@@ -187,6 +194,7 @@ class WorkflowContext:
         self._default_retry = default_retry
         self._inline_wait_max = inline_wait_max
         self._clock = clock
+        self._resolve = resolve
         self._root: _Scope | None = None
         self._seen: set[str] = set()
         # Quiescence tracking (live mode only).
@@ -213,7 +221,7 @@ class WorkflowContext:
         """(status, wake_at) for a quiescent run. wake_at None = signal only."""
         kinds = {k for k, _ in self._parked.values()}
         deadlines = [u for _, u in self._parked.values() if u is not None]
-        status = "waiting" if "signal" in kinds else "sleeping"
+        status = "waiting" if kinds & {"signal", "child"} else "sleeping"
         return status, (min(deadlines) if deadlines else None)
 
     def assert_journal_consumed(self) -> None:
@@ -404,6 +412,73 @@ class WorkflowContext:
                 continue
             await store.put_step(key, kind, name, "failed", attempts, error=err)
             raise StepFailed(name, err) from exc
+
+    # -- child workflows ----------------------------------------------------
+
+    def _resolve_child(self, workflow: Any) -> tuple[str, str]:
+        if self._resolve is None:
+            raise RuntimeError("child workflows need a Flow-backed context")
+        return self._resolve(workflow)
+
+    def child(self, workflow: Any, /, *args: Any, **kwargs: Any) -> Awaitable[Any]:
+        """Run a registered workflow as a child run and wait for its result.
+
+        The child is an ordinary run (any worker may execute it, it has its own
+        journal and retries). The parent is released while it waits. If the
+        child fails or is cancelled, ChildFailed (a StepFailed) is raised here.
+        Cancelling the parent cancels children it is waiting on.
+        """
+        name, queue = self._resolve_child(workflow)
+        key = self._alloc()
+        return self._track(key, self._child(key, name, queue, args, kwargs, wait=True))
+
+    def start_child(self, workflow: Any, /, *args: Any, **kwargs: Any) -> Awaitable[uuid.UUID]:
+        """Start a registered workflow as a detached child and return its run id
+        without waiting. Detached children outlive the parent's cancellation."""
+        name, queue = self._resolve_child(workflow)
+        key = self._alloc()
+        return self._track(key, self._child(key, name, queue, args, kwargs, wait=False))
+
+    async def _child(
+        self, key: str, name: str, queue: str, args: tuple, kwargs: dict, *, wait: bool
+    ) -> Any:
+        kind = "child" if wait else "child_start"
+        entry = self._entry(key, kind, name)
+        if entry is not None and entry["status"] == "completed":
+            out = entry["output"]
+            return out["result"] if wait else uuid.UUID(out["child_id"])
+        if entry is not None and entry["status"] == "failed":
+            child_id = uuid.UUID((entry["output"] or {})["child_id"])
+            raise ChildFailed(name, child_id, entry["error"] or {})
+        store = self._live(key)
+
+        if entry is None:
+            child_id = uuid.uuid5(_CHILD_NS, f"{self.run_id}:{key}")
+            payload = normalize({"args": list(args), "kwargs": kwargs})
+            await store.start_child(key, kind, name, queue, child_id, payload)
+            if not wait:
+                return child_id
+        else:
+            child_id = uuid.UUID(entry["output"]["child_id"])
+
+        outcome = await store.child_outcome(child_id)
+        if outcome is None or outcome[0] in _TERMINAL:
+            status, result, error = outcome or ("failed", None, None)
+            ref = {"child_id": str(child_id)}
+            if status == "completed":
+                await store.put_step(key, kind, name, "completed", 1,
+                                     output={**ref, "result": result})
+                return result
+            if outcome is None:
+                error = {"type": "ChildMissing", "message": f"child run {child_id} not found"}
+            elif status == "cancelled":
+                error = {"type": "WorkflowCancelled", "message": f"child run {child_id} was cancelled"}
+            await store.put_step(key, kind, name, "failed", 1, output=ref, error=error)
+            raise ChildFailed(name, child_id, error or {})
+
+        # Not finished: park. The child's completion wakes this run (see
+        # RunStore.finish), and re-execution lands back here.
+        await self._park(key, "child", None)
 
     # -- durable timers -----------------------------------------------------
 

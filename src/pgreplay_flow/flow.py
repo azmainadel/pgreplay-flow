@@ -147,6 +147,15 @@ class Flow:
 
         return deco
 
+    def _child_ref(self, workflow: WorkflowFn | str) -> tuple[str, str]:
+        """(name, queue) for a child workflow. A string name that is not
+        registered in this process is allowed (another service's workers may
+        run it); it goes to the 'default' queue."""
+        if isinstance(workflow, str) and workflow not in self.workflows:
+            return workflow, "default"
+        wf = self._resolve(workflow)
+        return wf.name, wf.queue
+
     def _resolve(self, workflow: WorkflowFn | str) -> WorkflowDef:
         name = workflow if isinstance(workflow, str) else getattr(
             workflow, "__pgreplay_workflow__", None
@@ -286,22 +295,95 @@ class Flow:
                 await conn.execute("SELECT pg_notify(%s, '')", (self.wake_channel,))
 
     async def cancel(self, run_id: uuid.UUID) -> bool:
-        """Cancel a non-terminal run. A worker executing it loses its lease and
-        stops at its next journal write or heartbeat. Returns False if already done."""
+        """Cancel a non-terminal run and, recursively, the attached children
+        (ctx.child) it is waiting on. A worker executing a cancelled run loses its
+        lease and stops at its next journal write or heartbeat. A parent waiting
+        on a cancelled child is woken and sees ChildFailed.
+        Returns False if the run had already finished."""
+        s = sql.Identifier(self.schema)
         async with self.pool.connection() as conn, conn.transaction():
+            # Lock order is parent -> child everywhere (see RunStore.finish).
             cur = await conn.execute(
-                sql.SQL("""
-                UPDATE {0}.runs
-                SET status = 'cancelled', finished_at = now(), updated_at = now(),
-                    lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, ready_at = NULL
-                WHERE id = %s AND status NOT IN ('completed','failed','cancelled') RETURNING 1
-                """).format(sql.Identifier(self.schema)),
+                sql.SQL("SELECT parent_id, attached FROM {0}.runs WHERE id = %s").format(s),
                 (run_id,),
             )
-            ok = await cur.fetchone() is not None
-            if ok:
-                await conn.execute("SELECT pg_notify(%s, %s)", (self.done_channel, str(run_id)))
-            return ok
+            row = await cur.fetchone()
+            if row is None:
+                raise RunNotFound(str(run_id))
+            parent_id = row[0] if row[1] else None
+            if parent_id is not None:
+                await conn.execute(
+                    sql.SQL("SELECT 1 FROM {0}.runs WHERE id = %s FOR UPDATE").format(s),
+                    (parent_id,),
+                )
+            cancelled: list[uuid.UUID] = []
+            level = [run_id]
+            while level:
+                cur = await conn.execute(
+                    sql.SQL("""
+                    UPDATE {0}.runs
+                    SET status = 'cancelled', finished_at = now(), updated_at = now(),
+                        lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                        ready_at = NULL
+                    WHERE id = ANY(%s) AND status NOT IN ('completed','failed','cancelled')
+                    RETURNING id
+                    """).format(s),
+                    (level,),
+                )
+                done = [r[0] for r in await cur.fetchall()]
+                cancelled.extend(done)
+                if not done:
+                    break
+                cur = await conn.execute(
+                    sql.SQL("""
+                    SELECT id FROM {0}.runs
+                    WHERE parent_id = ANY(%s) AND attached
+                      AND status NOT IN ('completed','failed','cancelled')
+                    """).format(s),
+                    (done,),
+                )
+                level = [r[0] for r in await cur.fetchall()]
+            if not cancelled:
+                return False
+            if parent_id is not None:
+                await conn.execute(
+                    sql.SQL("""
+                    UPDATE {0}.runs SET ready_at = now(), updated_at = now()
+                    WHERE id = %s AND status IN ('waiting','sleeping')
+                    """).format(s),
+                    (parent_id,),
+                )
+                await conn.execute("SELECT pg_notify(%s, '')", (self.wake_channel,))
+            for rid in cancelled:
+                await conn.execute("SELECT pg_notify(%s, %s)", (self.done_channel, str(rid)))
+            return True
+
+    # -- inspection -------------------------------------------------------------
+
+    async def list_runs(
+        self,
+        *,
+        status: str | None = None,
+        workflow: str | None = None,
+        parent_id: uuid.UUID | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Most recent runs first (without args/result payloads)."""
+        async with self.pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                sql.SQL("""
+                SELECT id, workflow, queue, status, parent_id, attached, claims, recoveries,
+                       created_at, updated_at, finished_at, ready_at, lease_owner
+                FROM {0}.runs
+                WHERE (%s::text IS NULL OR status = %s)
+                  AND (%s::text IS NULL OR workflow = %s)
+                  AND (%s::uuid IS NULL OR parent_id = %s)
+                ORDER BY created_at DESC LIMIT %s
+                """).format(sql.Identifier(self.schema)),
+                (status, status, workflow, workflow, parent_id, parent_id, limit),
+            )
+            return await cur.fetchall()
 
     # -- replay and fork --------------------------------------------------------
 
@@ -319,7 +401,8 @@ class Flow:
         wf = self._resolve(run["workflow"])
         journal = await self._load_journal(run_id)
         ctx = WorkflowContext(
-            run_id=run_id, workflow=wf.name, journal=journal, store=None, default_retry=wf.retry
+            run_id=run_id, workflow=wf.name, journal=journal, store=None, default_retry=wf.retry,
+            resolve=self._child_ref,
         )
         status: str = run["status"]
 
@@ -582,6 +665,7 @@ class Worker:
             run_id=claim.run_id, workflow=wf.name, journal=journal, store=store,
             default_retry=wf.retry, inline_wait_max=self.inline_wait_max,
             clock=lambda: time.time() + offset,
+            resolve=self.flow._child_ref,
         )
         main = asyncio.get_running_loop().create_task(
             ctx._main(wf.fn, claim.args["args"], claim.args["kwargs"]),

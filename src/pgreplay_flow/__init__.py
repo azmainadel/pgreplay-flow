@@ -2,6 +2,7 @@
 
 from .context import StepInfo, WorkflowContext, step, step_info
 from .errors import (
+    ChildFailed,
     FlowError,
     NonDeterminismError,
     RunNotFound,
@@ -14,6 +15,7 @@ from .flow import Flow, ReplayReport, Worker
 from .retry import NO_RETRY, RetryPolicy
 
 __all__ = [
+    "ChildFailed",
     "NO_RETRY",
     "Flow",
     "FlowError",
